@@ -9,6 +9,9 @@ import json
 import winreg
 import shutil
 import glob
+import filecmp
+import requests
+import time
 
 # Constants
 CONFIG_FILE = "config.json"
@@ -29,18 +32,23 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                config = json.load(f)
+                # Ensure appids is a dictionary
+                if 'appids' in config and isinstance(config['appids'], list):
+                    # Convert old list format to new dictionary format
+                    config['appids'] = {appid: "Unknown" for appid in config['appids']}
+                return config
         except Exception as e:
             print(f"⚠️  Config error: {e}")
-    return {}
+    return {'steam_path': '', 'appids': {}}
 
-def save_config(steam_path, appids):
+def save_config(steam_path, appids_dict):
     """Save configuration to file"""
-    config = {'steam_path': steam_path, 'appids': appids}
+    config = {'steam_path': steam_path, 'appids': appids_dict}
     try:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=4, ensure_ascii=False)
-        print(f"💾 Config saved: {len(appids)} appids")
+        print(f"✅ Config saved: {len(appids_dict)} games")
         return True
     except Exception as e:
         print(f"❌ Save error: {e}")
@@ -55,90 +63,216 @@ def validate_steam_path(path):
     return (len(missing) == 0, "Valid" if len(missing) == 0 else f"Missing: {missing}")
 
 # =============================================================================
-# File Operations
+# Steam API Functions
 # =============================================================================
 
-def backup_files(steam_path, appids, source_subpath, backup_subpath, file_type="lua"):
-    """Generic file backup function"""
-    source_folder = os.path.join(steam_path, *source_subpath.split('/'))
-    backup_path = os.path.join(BACKUP_FOLDER, *backup_subpath.split('/'))
+def get_game_name(appid):
+    """Get game name from Steam API"""
+    try:
+        url = f"https://store.steampowered.com/api/appdetails?appids={appid}"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        if str(appid) in data and data[str(appid)]['success']:
+            return data[str(appid)]['data']['name']
+        
+        return "Unknown"
+    except requests.exceptions.RequestException:
+        return "Unknown"
+    except (KeyError, ValueError):
+        return "Unknown"
+
+def get_game_names(appids):
+    """Get game names for multiple AppIDs with rate limiting"""
+    print(f"🔍 Fetching game names from Steam API...")
+    game_names = {}
+    
+    for i, appid in enumerate(appids):
+        print(f"   📡 Querying {appid} ({i+1}/{len(appids)})...")
+        game_name = get_game_name(appid)
+        game_names[appid] = game_name
+        
+        # Rate limiting to be respectful to Steam API
+        if i < len(appids) - 1:  # Don't sleep after the last one
+            time.sleep(0.5)  # 500ms delay between requests
+    
+    return game_names
+
+def update_game_names(appids_dict, new_appids):
+    """Update game names for new AppIDs"""
+    if not new_appids:
+        return appids_dict
+    
+    # Get names only for new AppIDs
+    appids_to_query = [appid for appid in new_appids if appid not in appids_dict]
+    if not appids_to_query:
+        return appids_dict
+    
+    new_game_names = get_game_names(appids_to_query)
+    
+    # Update the dictionary with new game names
+    updated_dict = appids_dict.copy()
+    for appid, name in new_game_names.items():
+        updated_dict[appid] = name
+    
+    return updated_dict
+
+def format_game_display(appid, game_name):
+    """Format game display as 'appid = Game name'"""
+    return f"{appid} = {game_name}"
+
+# =============================================================================
+# Unified File Operations
+# =============================================================================
+
+def should_backup_file(source_path, dest_path):
+    """Check if file needs backup (new or modified)"""
+    if not os.path.exists(dest_path):
+        return True, "new"
+    
+    if not filecmp.cmp(source_path, dest_path, shallow=False):
+        return True, "modified"
+    
+    return False, "unchanged"
+
+def backup_game_files(steam_path, appids_dict, backup_type):
+    """Backup function for both Lua and Stats files"""
+    if backup_type == 'plugins':
+        source_folder = os.path.join(steam_path, "config", "stplug-in")
+        backup_subfolder = "config/stplug-in"
+        file_extension = ".lua"
+        display_name = "Plugin Files"
+    else:  # stats
+        source_folder = os.path.join(steam_path, "appcache", "stats")
+        backup_subfolder = "appcache/stats"
+        file_extension = ".bin"
+        display_name = "Statistics Files"
+    
+    backup_path = os.path.join(BACKUP_FOLDER, *backup_subfolder.split('/'))
     
     if not os.path.exists(source_folder):
-        print(f"❌ Folder missing: {source_folder}")
+        print(f"❌ Source folder not found: {source_folder}")
         return False
     
-    if not appids:
-        print(f"📝 No appids for {file_type} files")
+    if not appids_dict:
+        print(f"📝 No games specified for {display_name}")
         return True
     
     os.makedirs(backup_path, exist_ok=True)
     
-    if file_type == "stats":
-        return _backup_stats_files(source_folder, backup_path, appids)
-    else:
-        return _backup_lua_files(source_folder, backup_path, appids, f".{file_type}")
-
-def _backup_lua_files(source_folder, backup_path, appids, extension):
-    """Backup lua files with simple naming pattern"""
-    saved, missing = [], []
-    
-    for appid in appids:
-        filename = f"{appid}{extension}"
-        source = os.path.join(source_folder, filename)
-        dest = os.path.join(backup_path, filename)
-        
-        if os.path.exists(source):
-            shutil.copy2(source, dest)
-            saved.append(filename)
-        else:
-            missing.append(filename)
-    
-    return _report_backup(saved, missing, extension.strip('.'))
-
-def _backup_stats_files(stats_folder, backup_path, appids):
-    """Backup stats files with pattern matching"""
     saved_files = []
+    skipped_files = []
+    missing_files = []
     
-    for appid in appids:
-        pattern = os.path.join(stats_folder, f"*{appid}*")
-        for source_file in glob.glob(pattern):
-            if os.path.isfile(source_file):
-                filename = os.path.basename(source_file)
-                shutil.copy2(source_file, os.path.join(backup_path, filename))
-                saved_files.append(filename)
+    appid_list = list(appids_dict.keys())
     
-    if saved_files:
-        print(f"💾 Stats: {len(saved_files)} files for {len(appids)} appids")
-        # Group by appid for clean output
-        by_appid = {}
-        for file in saved_files:
-            for appid in appids:
-                if appid in file:
-                    by_appid.setdefault(appid, []).append(file)
-                    break
-        
-        for appid, files in by_appid.items():
-            print(f"   🎮 {appid}: {len(files)} files")
-            for filename in sorted(files):
-                print(f"      📄 {filename}")
-        return True
-    else:
-        print("❌ No stats files found")
-        return False
+    for appid in appid_list:
+        if backup_type == 'plugins':
+            # For plugins: simple filename pattern (appid.lua)
+            filename = f"{appid}{file_extension}"
+            source_file = os.path.join(source_folder, filename)
+            dest_file = os.path.join(backup_path, filename)
+            
+            if os.path.exists(source_file):
+                should_backup, reason = should_backup_file(source_file, dest_file)
+                if should_backup:
+                    shutil.copy2(source_file, dest_file)
+                    saved_files.append((filename, reason, appid, appids_dict[appid]))
+                else:
+                    skipped_files.append((filename, appid, appids_dict[appid]))
+            else:
+                missing_files.append((filename, appid, appids_dict[appid]))
+                
+        else:  # stats
+            # For stats: pattern matching (*appid*)
+            pattern = os.path.join(source_folder, f"*{appid}*")
+            for source_file in glob.glob(pattern):
+                if os.path.isfile(source_file):
+                    filename = os.path.basename(source_file)
+                    dest_file = os.path.join(backup_path, filename)
+                    
+                    should_backup, reason = should_backup_file(source_file, dest_file)
+                    if should_backup:
+                        shutil.copy2(source_file, dest_file)
+                        saved_files.append((filename, reason, appid, appids_dict[appid]))
+                    else:
+                        skipped_files.append((filename, appid, appids_dict[appid]))
+    
+    return _report_backup_results(saved_files, skipped_files, missing_files, display_name, file_extension, backup_type)
 
-def _report_backup(saved, missing, file_type):
-    """Report backup results"""
+def _report_backup_results(saved, skipped, missing, display_name, file_extension, backup_type):
+    """Report backup results for both plugins and stats"""
+    print(f"\n📁 {display_name} ({file_extension.upper()})")
+    print("─" * 60)
+    
     if saved:
-        print(f"💾 {file_type.title()}: {len(saved)} files")
-        for file in saved:
-            print(f"   📄 {file}")
+        print(f"✅ Updated: {len(saved)} file(s)")
         
-        if missing:
-            print(f"⚠️  Missing {len(missing)} files")
-        return True
-    else:
-        print(f"❌ No {file_type} files saved")
+        if backup_type == 'plugins':
+            # For plugins: simple list
+            for filename, reason, appid, game_name in saved:
+                status_icon = "🆕" if reason == "new" else "📝"
+                game_display = format_game_display(appid, game_name)
+                print(f"   {status_icon} {filename}")
+                print(f"      🎮 {game_display} ({reason})")
+        else:
+            # For stats: group by AppID
+            by_appid = {}
+            for file, reason, appid, game_name in saved:
+                by_appid.setdefault((appid, game_name), []).append((file, reason))
+            
+            for (appid, game_name), files in sorted(by_appid.items()):
+                game_display = format_game_display(appid, game_name)
+                print(f"   🎮 {game_display}:")
+                for filename, reason in sorted(files):
+                    status_icon = "🆕" if reason == "new" else "📝"
+                    print(f"      {status_icon} {filename}")
+    
+    if skipped:
+        print(f"📋 Unchanged: {len(skipped)} file(s)")
+        
+        if backup_type == 'plugins':
+            # For plugins: show first few
+            for filename, appid, game_name in skipped[:3]:
+                game_display = format_game_display(appid, game_name)
+                print(f"   ✅ {filename}")
+                print(f"      🎮 {game_display}")
+            if len(skipped) > 3:
+                print(f"   ... and {len(skipped) - 3} more unchanged files")
+        else:
+            # For stats: group by AppID
+            skipped_by_appid = {}
+            for file, appid, game_name in skipped:
+                skipped_by_appid.setdefault((appid, game_name), []).append(file)
+            
+            displayed = 0
+            for (appid, game_name), files in sorted(skipped_by_appid.items()):
+                if displayed < 3:
+                    game_display = format_game_display(appid, game_name)
+                    print(f"   🎮 {game_display}: {len(files)} unchanged files")
+                    displayed += 1
+            
+            total_games = len(skipped_by_appid)
+            if total_games > 3:
+                print(f"   ... and {total_games - 3} more games with unchanged files")
+    
+    if missing:
+        print(f"⚠️  Missing: {len(missing)} file(s)")
+        for filename, appid, game_name in missing:
+            game_display = format_game_display(appid, game_name)
+            print(f"   ❌ {filename}")
+            print(f"      🎮 {game_display}")
+    
+    # Return True if operation was successful (files were processed)
+    # Only return False if there was an actual error
+    if not saved and not skipped and backup_type == 'plugins':
+        # For plugins, if no files at all were found, it might be an error
+        print("❌ No files found or processed")
         return False
+    
+    # Operation successful if we processed files (even if none needed updating)
+    return True
 
 # =============================================================================
 # Steam Detection
@@ -146,7 +280,7 @@ def _report_backup(saved, missing, file_type):
 
 def detect_steam():
     """Auto-detect Steam installation"""
-    print("🔍 Detecting Steam...")
+    print("🔍 Detecting Steam installation...")
     
     # Try registry first
     for hive, subkey, value_name in REGISTRY_PATHS:
@@ -154,22 +288,33 @@ def detect_steam():
             with winreg.OpenKey(hive, subkey) as key:
                 path, _ = winreg.QueryValueEx(key, value_name)
                 if path and os.path.exists(path):
+                    path = os.path.expandvars(path)  # Expand environment variables
                     path = path.replace("/", "\\")
-                    print(f"✅ Found: {path}")
+                    print(f"✅ Found in registry: {path}")
                     return path
-        except Exception:
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            print(f"⚠️  Permission denied accessing registry: {subkey}")
+            continue
+        except Exception as e:
+            print(f"⚠️  Registry error {subkey}: {e}")
             continue
     
-    print("❌ Not found in registry")
+    print("❌ Steam not found in registry")
     return None
 
 def get_steam_from_user():
     """Get Steam path from user"""
-    print("\n📁 Enter Steam path:")
-    print("   Examples: C:\\Program Files (x86)\\Steam, D:\\Steam")
+    print("\n📁 Manual Steam Path Setup")
+    print("─" * 30)
+    print("Examples:")
+    print("  • C:\\Program Files (x86)\\Steam")
+    print("  • D:\\Steam")
+    print("  • C:\\Games\\Steam")
     
     while True:
-        path = input("\nPath: ").strip()
+        path = input("\nEnter Steam path: ").strip()
         if not path:
             print("❌ Please enter a path")
             continue
@@ -183,7 +328,8 @@ def get_steam_from_user():
             print(f"✅ {msg}")
             return path
         else:
-            print(f"❌ {msg}\n   Please check path")
+            print(f"❌ {msg}")
+            print("Please check the path and try again")
 
 # =============================================================================
 # AppID Management
@@ -194,7 +340,7 @@ def get_appids_from_plugins(steam_path):
     plugin_folder = os.path.join(steam_path, "config", "stplug-in")
     
     if not os.path.exists(plugin_folder):
-        print(f"❌ Plugin folder missing: {plugin_folder}")
+        print(f"❌ Plugin folder not found: {plugin_folder}")
         return []
     
     try:
@@ -206,29 +352,30 @@ def get_appids_from_plugins(steam_path):
             print("❌ No plugin files found")
             return []
         
-        appids = [os.path.splitext(f)[0] for f in lua_files]
-        print(f"📄 Plugins: {len(appids)} appids → {appids}")
+        appids = [os.path.splitext(f)[0] for f in lua_files]  # Treat as text, no validation
+        print(f"📄 Found {len(appids)} plugin file(s)")
         return appids
         
     except Exception as e:
-        print(f"❌ Plugin error: {e}")
+        print(f"❌ Error reading plugins: {e}")
         return []
 
-def merge_appids(existing, new):
-    """Merge AppID lists"""
-    if not existing:
-        return new
-    if not new:
-        return existing
+def merge_appids(existing_dict, new_appids):
+    """Merge AppID lists and update game names"""
+    if not existing_dict:
+        existing_dict = {}
     
-    merged = list(set(existing + new))
-    added = [a for a in new if a not in existing]
+    if not new_appids:
+        return existing_dict
     
-    print(f"🔄 AppIDs: {len(existing)} + {len(new)} = {len(merged)}")
-    if added:
-        print(f"📥 New: {added}")
+    # Find new AppIDs that aren't in the existing dictionary
+    new_appids_found = [appid for appid in new_appids if appid not in existing_dict]
     
-    return merged
+    if new_appids_found:
+        print(f"🔄 Games: {len(existing_dict)} existing + {len(new_appids_found)} new")
+        print(f"📥 New AppIDs detected: {', '.join(new_appids_found)}")
+    
+    return existing_dict  # Game names will be updated separately
 
 # =============================================================================
 # Main Logic
@@ -237,14 +384,18 @@ def merge_appids(existing, new):
 def setup_steam_path():
     """Determine Steam path through multiple methods"""
     config = load_config()
-    existing_path = config.get('steam_path')
-    existing_appids = config.get('appids', [])
+    existing_path = config.get('steam_path', '')
+    existing_appids = config.get('appids', {})
     
     # Use existing config if valid
     if existing_path and validate_steam_path(existing_path)[0]:
-        print(f"📁 Using config: {existing_path}")
+        print(f"📁 Using configured path: {existing_path}")
         if existing_appids:
-            print(f"📋 Existing: {len(existing_appids)} appids")
+            print(f"📋 {len(existing_appids)} games in configuration")
+            # Show all configured games
+            for appid, game_name in sorted(existing_appids.items()):
+                game_display = format_game_display(appid, game_name)
+                print(f"   🎮 {game_display}")
         return existing_path, existing_appids
     
     # Auto-detect
@@ -253,39 +404,58 @@ def setup_steam_path():
         valid, msg = validate_steam_path(steam_path)
         if valid:
             return steam_path, existing_appids
-        print(f"❌ Invalid: {msg}")
+        print(f"❌ Invalid detected path: {msg}")
     
     # User input
     return get_steam_from_user(), existing_appids
 
-def should_update_config(new_path, old_path, new_appids, old_appids):
+def should_update_config(new_path, old_path, new_appids, old_appids_dict):
     """Check if config needs updating"""
-    return (new_path != old_path) or (new_appids and set(new_appids) - set(old_appids))
+    path_changed = new_path != old_path
+    new_appids_found = new_appids and any(appid not in old_appids_dict for appid in new_appids)
+    return path_changed or new_appids_found
 
-def run_backup(steam_path, all_appids, detected_appids, existing_appids, config_updated):
+def run_backup(steam_path, appids_dict, detected_appids, existing_appids_dict, config_updated):
     """Execute backup operations"""
-    print(f"\n💾 Backing up files...")
+    print(f"\n🚀 Starting Backup Process")
+    print("═" * 65)
     
-    # Backup plugin files (only newly detected)
-    lua_ok = backup_files(steam_path, detected_appids, "config/stplug-in", "config/stplug-in", "lua")
+    # Backup plugin files (.lua)
+    plugins_ok = backup_game_files(steam_path, appids_dict, 'plugins')
     
-    # Backup stats files (all appids from config)
-    stats_ok = backup_files(steam_path, all_appids, "appcache/stats", "appcache/stats", "stats")
+    # Backup stats files (.bin)
+    stats_ok = backup_game_files(steam_path, appids_dict, 'stats')
     
-    _print_summary(steam_path, all_appids, detected_appids, existing_appids, config_updated, lua_ok, stats_ok)
+    _print_summary(steam_path, appids_dict, detected_appids, existing_appids_dict, config_updated, plugins_ok, stats_ok)
 
-def _print_summary(steam_path, all_appids, detected_appids, existing_appids, config_updated, lua_ok, stats_ok):
+def _print_summary(steam_path, appids_dict, detected_appids, existing_appids_dict, config_updated, plugins_ok, stats_ok):
     """Print execution summary"""
-    print(f"\n🎯 Upstalua Complete!")
-    print(f"📍 Steam: {steam_path}")
-    print(f"🎮 AppIDs: {len(all_appids)} total")
+    print(f"\n🎯 Backup Complete!")
+    print("═" * 65)
+    print(f"📍 Steam Path: {steam_path}")
+    print(f"🎮 Total Games: {len(appids_dict)}")
     
-    if not config_updated:
-        print("   (no new appids)")
+    new_appids = [appid for appid in detected_appids if appid not in existing_appids_dict]
     
-    new_appids = [a for a in detected_appids if a not in existing_appids]
-    if new_appids:
-        print(f"📥 New: {new_appids}")
+    if config_updated:
+        if new_appids:
+            print(f"📥 New games added: {len(new_appids)}")
+            for appid in new_appids:
+                game_name = appids_dict.get(appid, "Unknown")
+                game_display = format_game_display(appid, game_name)
+                print(f"   🎮 {game_display}")
+        print(f"💾 Configuration updated")
+    else:
+        print(f"📋 No configuration changes needed")
+    
+    print(f"\n📊 Backup Results:")
+    print(f"   • Plugin files (.lua): {'✅ Success' if plugins_ok else '❌ Failed'}")
+    print(f"   • Statistics files (.bin): {'✅ Success' if stats_ok else '❌ Failed'}")
+    
+    if plugins_ok and stats_ok:
+        print(f"\n✅ All operations completed successfully!")
+    else:
+        print(f"\n⚠️  Some operations had issues")
 
 # =============================================================================
 # Main Execution
@@ -294,40 +464,51 @@ def _print_summary(steam_path, all_appids, detected_appids, existing_appids, con
 def main():
     """Main execution flow"""
     print("🎮 Upstalua - Steam Backup Manager")
-    print("=" * 45)
+    print("═" * 65)
     
     try:
         # Setup
-        steam_path, existing_appids = setup_steam_path()
+        steam_path, existing_appids_dict = setup_steam_path()
         if not steam_path:
+            print("❌ Could not determine Steam path")
             return
         
         # Validate
         valid, msg = validate_steam_path(steam_path)
         if not valid:
-            print(f"❌ Invalid: {msg}")
+            print(f"❌ Invalid Steam installation: {msg}")
             return
         
         # Detect AppIDs
-        print("\n🔍 Scanning plugins...")
+        print(f"\n🔍 Scanning for plugins...")
         detected_appids = get_appids_from_plugins(steam_path)
-        all_appids = merge_appids(existing_appids, detected_appids)
+        
+        # Merge AppIDs and update game names
+        merged_appids_dict = merge_appids(existing_appids_dict, detected_appids)
+        
+        # Update game names for new AppIDs
+        if detected_appids:
+            merged_appids_dict = update_game_names(merged_appids_dict, detected_appids)
         
         # Update config if needed
-        config_updated = should_update_config(steam_path, existing_appids, detected_appids, existing_appids)
+        config = load_config()
+        old_path = config.get('steam_path', '')
+        config_updated = should_update_config(steam_path, old_path, detected_appids, existing_appids_dict)
+        
         if config_updated:
-            if not save_config(steam_path, all_appids):
+            if not save_config(steam_path, merged_appids_dict):
+                print("❌ Failed to save configuration")
                 return
         
         # Run backups
-        run_backup(steam_path, all_appids, detected_appids, existing_appids, config_updated)
+        run_backup(steam_path, merged_appids_dict, detected_appids, existing_appids_dict, config_updated)
     
     except KeyboardInterrupt:
-        print("\n\n👋 Cancelled")
+        print("\n\n⏹️  Operation cancelled by user")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"\n❌ Unexpected error: {e}")
 
-    input('Press the Enter key to exit...')
+    input('\nPress Enter to exit...')
 
 # =============================================================================
 # Utility Functions
@@ -341,7 +522,11 @@ def get_steam_path():
 
 def get_appids():
     """Get AppIDs for external scripts"""
-    return load_config().get('appids', [])
+    return list(load_config().get('appids', {}).keys())
+
+def get_games():
+    """Get games dictionary for external scripts"""
+    return load_config().get('appids', {})
 
 def is_configured():
     """Check if configured"""
