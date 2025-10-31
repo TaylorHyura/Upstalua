@@ -234,28 +234,19 @@ def _report_backup_results(saved, skipped, missing, display_name, file_extension
         
         if backup_type == 'plugins':
             # For plugins: show first few
-            for filename, appid, game_name in skipped[:3]:
+            for filename, appid, game_name in skipped:
                 game_display = format_game_display(appid, game_name)
                 print(f"   ✅ {filename}")
                 print(f"      🎮 {game_display}")
-            if len(skipped) > 3:
-                print(f"   ... and {len(skipped) - 3} more unchanged files")
         else:
             # For stats: group by AppID
             skipped_by_appid = {}
             for file, appid, game_name in skipped:
                 skipped_by_appid.setdefault((appid, game_name), []).append(file)
             
-            displayed = 0
             for (appid, game_name), files in sorted(skipped_by_appid.items()):
-                if displayed < 3:
-                    game_display = format_game_display(appid, game_name)
-                    print(f"   🎮 {game_display}: {len(files)} unchanged files")
-                    displayed += 1
-            
-            total_games = len(skipped_by_appid)
-            if total_games > 3:
-                print(f"   ... and {total_games - 3} more games with unchanged files")
+                game_display = format_game_display(appid, game_name)
+                print(f"   🎮 {game_display}: {len(files)} unchanged files")
     
     if missing:
         print(f"⚠️  Missing: {len(missing)} file(s)")
