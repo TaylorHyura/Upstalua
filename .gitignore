@@ -1,2 +1,4 @@
 /backup
+/rclone
 /config.json
+/rclone.conf
